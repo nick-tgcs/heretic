@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   checks:
     name: Check and build (Python ${{ matrix.python-version }})
