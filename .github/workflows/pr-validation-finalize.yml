@@ -20,7 +20,7 @@ jobs:
     if: github.event.workflow_run.event == 'pull_request'
     steps:
       - name: Comment validation result and merge Dependabot if green
-        uses: actions/github-script@v9
+        uses: actions/github-script@v8
         with:
           script: |
             const marker = '<!-- tgcs-pr-validation-result -->';
@@ -83,6 +83,7 @@ jobs:
 
             let mergeOutcome = 'Not a Dependabot PR; no auto-merge attempted.';
             let mergeSucceeded = false;
+            let mergeDeferred = false;
 
             if (isDependabot) {
               if (validationPassed) {
@@ -118,7 +119,24 @@ jobs:
                     }
                   } catch (mergeError) {
                     core.warning(`Auto-merge failed: ${mergeError.message}`);
-                    mergeOutcome = `Dependabot PR passed validation, but auto-merge failed: ${mergeError.message}`;
+                    const baseChanged = /base branch was modified|Head branch was modified/i.test(mergeError.message || '');
+                    if (baseChanged) {
+                      try {
+                        await github.rest.pulls.updateBranch({
+                          owner,
+                          repo,
+                          pull_number: pr.number,
+                          expected_head_sha: workflowRun.head_sha,
+                        });
+                        mergeDeferred = true;
+                        mergeOutcome = 'Dependabot PR passed validation, but the base branch changed before merge. Requested a branch update so validation can rerun against the new base.';
+                      } catch (updateError) {
+                        core.warning(`Could not update Dependabot branch after base changed: ${updateError.message}`);
+                        mergeOutcome = `Dependabot PR passed validation, but auto-merge failed after the base branch changed and branch update failed: ${updateError.message}`;
+                      }
+                    } else {
+                      mergeOutcome = `Dependabot PR passed validation, but auto-merge failed: ${mergeError.message}`;
+                    }
                   }
                 }
               } else {
@@ -171,6 +189,6 @@ jobs:
               });
             }
 
-            if (isDependabot && validationPassed && !mergeSucceeded) {
+            if (isDependabot && validationPassed && !mergeSucceeded && !mergeDeferred) {
               core.setFailed(mergeOutcome);
             }
