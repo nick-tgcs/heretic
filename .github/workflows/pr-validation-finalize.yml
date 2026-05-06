@@ -1,0 +1,176 @@
+name: PR Validation Finalize
+
+on:
+  workflow_run:
+    workflows:
+      - Common PR Validation
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  comment-and-finalize:
+    name: Comment PR result and merge green Dependabot PRs
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Comment validation result and merge Dependabot if green
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const marker = '<!-- tgcs-pr-validation-result -->';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflowRun = context.payload.workflow_run;
+
+            const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner,
+              repo,
+              commit_sha: workflowRun.head_sha,
+            });
+
+            const prs = associated.data.filter((candidate) => candidate.head.sha === workflowRun.head_sha);
+            const pr = prs.find((candidate) => candidate.state === 'open') || prs[0];
+
+            if (!pr) {
+              core.info(`No PR found for validation commit ${workflowRun.head_sha}; nothing to comment or merge.`);
+              return;
+            }
+
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner,
+              repo,
+              run_id: workflowRun.id,
+              per_page: 100,
+            });
+
+            const resultLabel = (value) => {
+              if (value === 'success') return '✅ Passed';
+              if (value === 'failure') return '❌ Failed';
+              if (value === 'cancelled') return '⚠️ Cancelled';
+              if (value === 'timed_out') return '⏱️ Timed out';
+              if (value === 'skipped') return '⏭️ Skipped';
+              if (value === null || value === undefined) return '⚠️ Unknown';
+              return `⚠️ ${value}`;
+            };
+
+            const duration = (job) => {
+              if (!job.started_at || !job.completed_at) return '';
+              const ms = new Date(job.completed_at) - new Date(job.started_at);
+              if (!Number.isFinite(ms) || ms < 0) return '';
+              const seconds = Math.round(ms / 1000);
+              if (seconds < 60) return `${seconds}s`;
+              const minutes = Math.floor(seconds / 60);
+              const rest = seconds % 60;
+              return `${minutes}m ${rest}s`;
+            };
+
+            const jobRows = jobs
+              .filter((job) => job.name !== 'Complete job')
+              .map((job) => `| ${job.name.replace(/\|/g, '\\|')} | ${resultLabel(job.conclusion)} | ${duration(job)} |`)
+              .join('\n') || '| No jobs found | ⚠️ Unknown | |';
+
+            const validationPassed = workflowRun.conclusion === 'success';
+            const isDependabot = pr.user.login === 'dependabot[bot]' && pr.head.ref.startsWith('dependabot/');
+            const shortSha = workflowRun.head_sha.slice(0, 7);
+            const statusIcon = validationPassed ? '✅' : '❌';
+            const artifactUrl = `${workflowRun.html_url}#artifacts`;
+
+            let mergeOutcome = 'Not a Dependabot PR; no auto-merge attempted.';
+            let mergeSucceeded = false;
+
+            if (isDependabot) {
+              if (validationPassed) {
+                if (pr.draft) {
+                  mergeOutcome = 'Dependabot PR is still draft; auto-merge was not attempted.';
+                } else if (pr.head.sha !== workflowRun.head_sha) {
+                  mergeOutcome = `PR head SHA changed after validation (${pr.head.sha.slice(0, 7)} != ${shortSha}); auto-merge was not attempted.`;
+                } else {
+                  try {
+                    await github.rest.pulls.merge({
+                      owner,
+                      repo,
+                      pull_number: pr.number,
+                      merge_method: 'squash',
+                      commit_title: pr.title,
+                      commit_message: `Validated by Common PR Validation run ${workflowRun.id}.`,
+                    });
+                    mergeSucceeded = true;
+                    mergeOutcome = 'Dependabot PR passed validation and was squash-merged automatically.';
+
+                    if (pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`) {
+                      try {
+                        await github.rest.git.deleteRef({
+                          owner,
+                          repo,
+                          ref: `heads/${pr.head.ref}`,
+                        });
+                        mergeOutcome += ' Source branch was deleted.';
+                      } catch (deleteError) {
+                        core.warning(`Merged, but could not delete source branch: ${deleteError.message}`);
+                        mergeOutcome += ` Source branch deletion failed: ${deleteError.message}`;
+                      }
+                    }
+                  } catch (mergeError) {
+                    core.warning(`Auto-merge failed: ${mergeError.message}`);
+                    mergeOutcome = `Dependabot PR passed validation, but auto-merge failed: ${mergeError.message}`;
+                  }
+                }
+              } else {
+                mergeOutcome = `Dependabot PR did not pass validation (${workflowRun.conclusion}); auto-merge was not attempted.`;
+              }
+            }
+
+            const body = `${marker}
+            ## PR Validation Result ${statusIcon}
+
+            PR: #${pr.number} — ${pr.title}
+            Commit: \`${shortSha}\`
+            Author: \`${pr.user.login}\`
+            Workflow run: ${workflowRun.html_url}
+
+            | Check | Result | Duration |
+            | --- | --- | --- |
+            | Overall workflow | ${resultLabel(workflowRun.conclusion)} | |
+            ${jobRows}
+
+            Artifacts/logs: ${artifactUrl}
+
+            **Dependabot handling:** ${mergeOutcome}
+            `.replace(/^ {12}/gm, '').trim();
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) =>
+              comment.user.type === 'Bot' && comment.body && comment.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pr.number,
+                body,
+              });
+            }
+
+            if (isDependabot && validationPassed && !mergeSucceeded) {
+              core.setFailed(mergeOutcome);
+            }
