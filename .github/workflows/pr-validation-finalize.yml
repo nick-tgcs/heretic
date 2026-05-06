@@ -20,7 +20,7 @@ jobs:
     if: github.event.workflow_run.event == 'pull_request'
     steps:
       - name: Comment validation result and merge Dependabot if green
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const marker = '<!-- tgcs-pr-validation-result -->';
