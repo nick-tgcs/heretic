@@ -20,7 +20,7 @@ concurrency:
 jobs:
   python-checks:
     name: Python checks (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 45
     strategy:
       fail-fast: false
